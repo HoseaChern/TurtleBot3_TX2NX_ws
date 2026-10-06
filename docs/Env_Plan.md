@@ -6,7 +6,7 @@
 
 本任务涉及两台设备，版本信息如下。
 
-PC（开发与训练机）：
+PC（编码与训练机）：
 
 | 项目         | 值                                                    |
 | ------------ | ----------------------------------------------------- |
@@ -17,7 +17,7 @@ PC（开发与训练机）：
 | 深度学习框架 | PyTorch（cu128），Ultralytics YOLO                    |
 | 网络代理     | Clash Verge，`127.0.0.1:7897`，系统代理模式，手动启动 |
 
-NX（部署机）：
+NX（编译与部署机）：
 
 | 项目     | 值                                          |
 | -------- | ------------------------------------------- |
@@ -49,8 +49,10 @@ NX 的 TensorRT 版本不可升级，结论由两条已核实的事实推出：
 
 由 1.1 与 1.2 得出职责划分：
 
-- PC：训练 YOLO 模型，导出 ONNX，构建 arm64 ROS 2 镜像。
-- NX：将 ONNX 转换为 TensorRT engine，以 C++ ROS 2 节点加载 engine 并推理。
+- PC：用 VSCode 编写 ROS 2 代码，训练 YOLO 模型并导出 ONNX。不参与 NX 的镜像构建。
+- NX：原生构建 arm64 镜像，将 ONNX 转换为 TensorRT engine，以 C++ ROS 2 节点加载 engine 并推理。
+
+选择"编码在 PC、编译在 NX"的依据：NX 的 CPU 不适合高频编译，而 PC 的 CPU 编译与调试快；镜像在 NX 原生构建，因 amd64 到 arm64 的交叉构建需 QEMU 模拟，其结果的可信度低于原生构建，且本任务的镜像体量小，原生构建无性能压力。
 
 部署链路为：
 
@@ -71,15 +73,22 @@ NX:  ROS 2 C++ 节点  --加载-->  model.engine  --发布-->  检测结果话�
 
 该方案的风险集中在工具链差异：容器内 gcc 13 链接宿主的 TensorRT 8.2 头文件与库。此风险由测试三（关键路径）验证。
 
-### 1.5 镜像传输
+### 1.5 工作流与数据传输
 
-PC 与 NX 架构不同，镜像不通过 registry 中转，改用点对点千兆网线直连传输：
+编码在 PC，编译在 NX。传输对象为源码与模型，二者均为小文件，用 `rsync` over SSH 同步，走 3.3 节配置的点对点千兆网线。
 
-- PC 用 `docker buildx build --platform linux/arm64 --load` 构建并落到本地镜像列表。
-- PC 与 NX 以网线直连、配置静态 IP，用 `nc` 明文传输，避免 SSH 加密使 NX 的 CPU 成为瓶颈。
-- NX 用 `docker load` 导入。
+```text
+PC（编码 / 训练）                         NX（原生编译 / 推理）
+  编辑 src/（VSCode + 本地 ROS 2 Jazzy）    docker build（arm64 原生）
+  训练 YOLO，导出 model.onnx               容器内 colcon build
+                                           trtexec 转换 engine，运行推理
+        |           rsync over SSH                 ^
+        +------ 直连千兆网线 192.168.60.0/24 ------+
+```
 
-不需要 Docker Hub 或私有仓库账号。待镜像迭代频繁后再评估引入 registry。
+不使用镜像仓库：镜像在 NX 原生构建，无需传输镜像。不使用 `nc`：`nc` 的适用场景是 GB 级大文件打满网口，而数据集留在 PC 训练、不进入 NX，NX 只需源码与模型这类小文件，`rsync` 的增量与校验特性更合适。
+
+`rsync` 走 SSH 而非 daemon：同一条 SSH 通道既用于文件同步，也用于远程触发 NX 的编译命令，减少一处服务配置。
 
 ---
 
@@ -127,7 +136,7 @@ sudo vim /etc/fstab
 追加以下行，`<uuid>` 替换为 `blkid` 输出：
 
 ```text
-UUID=<uuid> /mnt/nvme ext4 defaults 0 2
+UUID=<uuid> /mnt/nvme0n1p1 ext4 defaults 0 2
 ```
 
 挂载并验证：
@@ -210,7 +219,7 @@ sudo apt-get install -y nvidia-docker2
 
 ```bash
 sudo systemctl restart docker
-docker info | grep -iE 'Default Runtime|Runtimes'
+sudo docker info | grep -iE 'Default Runtime|Runtimes'
 ```
 
 预期输出含 `Default Runtime: nvidia`。
@@ -234,8 +243,8 @@ sudo systemctl stop docker docker.socket containerd
 用 `rsync` 复制，保留属主、权限与扩展属性。`cp -r` 不保留属性，会导致 `overlay2` 目录属主错乱而无法启动：
 
 ```bash
-sudo mkdir -p /mnt/nvme/docker
-sudo rsync -aHAX /var/lib/docker/ /mnt/nvme/docker/
+sudo mkdir -p /mnt/nvme0n1p1/docker
+sudo rsync -aHAX /var/lib/docker/ /mnt/nvme0n1p1/docker/
 ```
 
 在 `/etc/docker/daemon.json` 中追加 `data-root`。完整内容如下：
@@ -249,7 +258,7 @@ sudo rsync -aHAX /var/lib/docker/ /mnt/nvme/docker/
     }
   },
   "default-runtime": "nvidia",
-  "data-root": "/mnt/nvme/docker"
+  "data-root": "/mnt/nvme0n1p1/docker"
 }
 ```
 
@@ -257,10 +266,10 @@ sudo rsync -aHAX /var/lib/docker/ /mnt/nvme/docker/
 
 ```bash
 sudo systemctl start docker
-docker info | grep 'Docker Root Dir'
+sudo docker info | grep 'Docker Root Dir'
 ```
 
-预期输出 `Docker Root Dir: /mnt/nvme/docker`。确认新目录可用后，删除旧目录以释放 eMMC 空间：
+预期输出 `Docker Root Dir: /mnt/nvme0n1p1/docker`。确认新目录可用后，删除旧目录以释放 eMMC 空间：
 
 ```bash
 sudo rm -rf /var/lib/docker
@@ -298,92 +307,17 @@ sudo systemctl restart docker
 
 ## 3. PC 环境配置
 
-### 3.1 Docker 安装
+### 3.1 开发与训练环境
 
-PC 运行 Ubuntu 24.04，属于 Docker 官方支持的 LTS 版本。使用 Docker 官方 APT 仓库安装，版本可控，不使用 `apt install docker.io` 或 `get.docker.com` 脚本。apt 已配置自动走代理，安装过程无需额外设置。
+PC 承担编码与训练，不安装 Docker。三项工具均已就绪：
 
-卸载可能存在的旧版本：
+- 编码：VSCode 加本地 ROS 2 Jazzy（`/opt/ros/jazzy`）。在 VSCode 的 C/C++ 配置中把 `/opt/ros/jazzy/include/**` 加入 `includePath`，即可获得头文件补全与跳转。
+- 训练：`uv` 管理的 Python 3.12 虚拟环境（PyTorch cu128、Ultralytics）。
+- 同步：`rsync`，见 3.3。
 
-```bash
-sudo apt remove $(dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc | cut -f1)
-```
+不使用 VSCode Remote-SSH 连接 NX，理由：Remote-SSH 会在 NX 上安装并运行 VSCode Server，占用 NX 的内存与 CPU，且会把代码真源迁到 NX；而 NX 需保持最简。代码真源留在 PC。
 
-添加官方 GPG 密钥与仓库：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-```
-
-安装 Docker Engine：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-```
-
-验证：
-
-```bash
-sudo docker run hello-world
-```
-
-将当前用户加入 `docker` 组，之后重新登录：
-
-```bash
-sudo usermod -aG docker $USER
-```
-
-### 3.2 Docker daemon 代理
-
-apt 走代理与 `dockerd` 走代理相互独立。系统代理模式下 `dockerd` 不读取系统代理设置，需显式配置。创建 systemd drop-in：
-
-```bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
-sudo tee /etc/systemd/system/docker.service.d/proxy.conf > /dev/null <<'EOF'
-[Service]
-Environment="HTTP_PROXY=http://127.0.0.1:7897"
-Environment="HTTPS_PROXY=http://127.0.0.1:7897"
-Environment="NO_PROXY=localhost,127.0.0.1,::1"
-EOF
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-docker info | grep -i proxy
-```
-
-若 Clash 仅运行于系统代理模式，此配置必要；若启用 TUN 模式，则流量已被接管，此配置无害但非必需。
-
-### 3.3 跨架构构建
-
-PC 为 amd64，NX 为 arm64。在 PC 上为 NX 构建镜像须使用 Buildx 配合 QEMU 用户态模拟。QEMU 无法验证 CUDA 功能，涉及 CUDA 的镜像在 NX 上原生构建。
-
-安装 QEMU 用户态仿真：
-
-```bash
-sudo apt-get install -y qemu-user-static binfmt-support
-docker run --privileged --rm tonistiigi/binfmt --install all
-ls /proc/sys/fs/binfmt_misc/qemu-*
-```
-
-创建 Buildx Builder：
-
-```bash
-docker buildx create --name cross --use
-docker buildx inspect --bootstrap
-docker buildx ls
-```
-
-预期 `Platforms` 包含 `linux/arm64`。
-
-### 3.4 工作区结构
+### 3.2 工作区结构
 
 工作区根为当前 git 仓库 `~/Documents/TurtleBot3_TX2NX_ws/`。
 
@@ -404,11 +338,12 @@ TurtleBot3_TX2NX_ws/
 │       ├── CMakeLists.txt
 │       ├── src/
 │       └── launch/
+├── models/
+│   └── model.onnx
 ├── scripts/
 │   ├── setup_nvme.sh
 │   ├── setup_docker_nx.sh
-│   ├── setup_docker_pc.sh
-│   └── build_and_transfer.sh
+│   └── sync_to_nx.sh
 └── tests/
     ├── test1_jazzy_comm.md
     ├── test2_cuda.md
@@ -427,20 +362,20 @@ log/
 
 `src/` 当前仅包含最小验证所需的节点实现，后续导航、感知、控制模块在最小验证通过后以独立包加入。
 
-### 3.5 镜像与数据传输
+### 3.3 网络与数据同步
 
-PC 与 NX 均为千兆网口，用点对点网线直连，配置静态 IP，用 `nc` 明文传输。选择 `nc` 而非 `scp` 的依据：传输时间 $t = S / B$，$B = \min(B_{\text{link}}, B_{\text{disk}}, B_{\text{cpu}})$。链路与 NVMe 存储均非瓶颈，而 NX 的 CPU 在 SSH 加解密上是瓶颈；`nc` 不做加密，可达链路上限 $118$ MB/s。
+PC 与 NX 用点对点千兆网线直连，配置静态 IP，用 `rsync` over SSH 同步源码与模型。直连旁路路由器与 Wi-Fi，链路两端均为千兆，有效带宽上限 118 MB/s。
 
-#### 3.5.1 直连链路配置
+#### 3.3.1 直连链路配置
 
-PC 端使用 USB 3.0 千兆网卡 `enx00e04c680c2f`，Wi-Fi 保持用于上网与代理，两条链路互不干扰：
+PC 端使用板载千兆网卡 `enp8s0`，Wi-Fi（`wlp14s0`）保持用于上网与代理，两条链路互不干扰：
 
 ```bash
-sudo ip addr add 192.168.60.1/24 dev enx00e04c680c2f
-sudo ip link set enx00e04c680c2f up
+sudo ip addr add 192.168.60.1/24 dev enp8s0
+sudo ip link set enp8s0 up
 ```
 
-NX 端：
+NX 端（网口名以 `ip -br link` 为准，TX2 NX 上为 `eth0`）：
 
 ```bash
 sudo ip addr add 192.168.60.2/24 dev eth0
@@ -453,7 +388,7 @@ sudo ip link set eth0 up
 ping -c 3 192.168.60.2
 ```
 
-#### 3.5.2 带宽验证
+#### 3.3.2 带宽验证
 
 在 NX 上启动服务端：
 
@@ -469,49 +404,38 @@ sudo apt-get install -y iperf3
 iperf3 -c 192.168.60.2
 ```
 
-预期约 $900$ Mbps 以上。
+预期约 900 Mbps 以上。
 
-#### 3.5.3 构建与传输
+#### 3.3.3 SSH 与 rsync 同步
 
-构建 arm64 镜像并落到本地镜像列表：
-
-```bash
-docker buildx build --platform linux/arm64 \
-  -t jazzy_minimal:arm64 --load \
-  -f docker/jazzy_minimal/Dockerfile .
-```
-
-NX 端接收：
+NX 端启用 SSH 服务：
 
 ```bash
-nc -l -p 9000 | docker load
+sudo apt-get install -y openssh-server
+sudo systemctl enable --now ssh
 ```
 
-PC 端发送：
+先在 NX 上创建与 PC 同名的工作区目录，再从 PC 推送。`rsync` 只能在目标父目录已存在时创建其下的子目录，故这一步不可省略：
 
 ```bash
-docker save jazzy_minimal:arm64 | nc 192.168.60.2 9000
+# NX 上
+mkdir -p ~/TurtleBot3_TX2NX_ws
 ```
 
-`nc` 语法因实现而异：Ubuntu 18.04 的 netcat-openbsd 用 `nc -l 9000`。两端对齐即可。
-
-传目录同理：
+同步整个工作区，作为 NX 侧的镜像副本与备份。命令须在 PC 的工作区根 `~/Documents/TurtleBot3_TX2NX_ws/` 下执行，`<user>` 替换为 NX 的登录用户名（本机两台设备同名，均为 `changli`），目标地址为直连 IP `192.168.60.2`：
 
 ```bash
-# PC
-tar cf - <dir> | nc 192.168.60.2 9000
-# NX
-nc -l -p 9000 | tar xf - -C /mnt/nvme/<dest>
+rsync -avz --delete -e ssh \
+  --exclude 'build' --exclude 'install' --exclude 'log' \
+  ./ <user>@192.168.60.2:~/TurtleBot3_TX2NX_ws/
 ```
 
-#### 3.5.4 压缩策略
+`--delete` 使 NX 副本与 PC 源一一对应。排除 `build`、`install`、`log` 三类生成物：它们在 NX 本地由 colcon 生成，不同步。`.git` 一并同步，使 NX 副本可作为完整备份恢复。工作区为纯文本，同步量与耗时均可忽略。
 
-不对 `docker save` 的输出再 `gzip`。镜像层本身已压缩，二次压缩收益低，且 NX 的 CPU 解压会成为新瓶颈。未压缩的数据集若需压缩，用 `zstd` 取代 `gzip`，压缩率相近而解压快数倍。
+#### 3.3.4 注意
 
-#### 3.5.5 注意
-
-- 直连网段不走代理。Clash 为系统代理模式，`nc` 不读取代理设置，不受影响。若切换到 TUN 模式，需把 `192.168.60.0/24` 加入 Clash 直连规则。
-- 接收目标写 `/mnt/nvme/`，不占 eMMC。Docker 数据目录已在 2.3 节迁移至 NVMe。
+- 直连网段不走代理。Clash 为系统代理模式，`rsync` 与 `ssh` 不读取代理设置，不受影响。若切换到 TUN 模式，需把 `192.168.60.0/24` 加入 Clash 直连规则。
+- 直连静态 IP 在重启后不保留。若要持久化，把地址配置写入 NX 的 `/etc/network/interfaces` 或 PC 的 NetworkManager 连接配置。
 
 ---
 
@@ -581,7 +505,16 @@ exec "$@"
 
 `CMD ["bash"]` 保证不带命令直接运行容器时进入交互 shell，避免 `exec "$@"` 因参数为空而退出。
 
-按 3.5 构建、传输、导入后，在 NX 上运行：
+在 NX 上原生构建镜像。先按 3.3.3 同步源码，再执行：
+
+```bash
+cd ~/TurtleBot3_TX2NX_ws
+docker build -t jazzy_minimal:arm64 -f docker/jazzy_minimal/Dockerfile .
+```
+
+不带 `--platform`，构建结果即 NX 的 arm64。
+
+运行：
 
 ```bash
 docker run --network host -it --name jazzy_test jazzy_minimal:arm64
@@ -599,6 +532,16 @@ ros2 launch minimal_test minimal_test.launch.py
 docker exec -it jazzy_test bash
 ros2 topic list
 ros2 topic echo /topic
+```
+
+开发迭代时不重建镜像，用挂载源码的方式在容器内编译，`build` 等中间产物留在 NX 本地磁盘：
+
+```bash
+docker run --rm -it \
+  -v ~/TurtleBot3_TX2NX_ws/src:/ros2_ws/src \
+  -v ~/TurtleBot3_TX2NX_ws/build:/ros2_ws/build \
+  jazzy_minimal:arm64 \
+  bash -c 'colcon build'
 ```
 
 #### 4.1.4 预期结果
@@ -654,7 +597,7 @@ int main() {
 
 #### 4.2.3 构建与运行
 
-CUDA 测试在 NX 上原生构建，不经过 PC 的 QEMU。
+CUDA 测试在 NX 上原生构建，不经过交叉编译。
 
 ```bash
 cd ~/Documents/TurtleBot3_TX2NX_ws
@@ -682,14 +625,16 @@ model = YOLO("yolov8n.pt")
 model.export(format="onnx", opset=12, imgsz=640)
 ```
 
-将导出的 `model.onnx` 传入 NX。
+将导出的 `model.onnx` 放入 `models/`，按 3.3.3 同步到 NX。
 
 #### 4.3.3 容器内转换与推理
 
-在 Jazzy 容器内确认 TensorRT 可见：
+在 NX 上，将模型挂载进 Jazzy 容器：
 
 ```bash
-docker run --network host -it -v /home/<user>/model.onnx:/work/model.onnx jazzy_minimal:arm64
+docker run --network host -it \
+  -v ~/TurtleBot3_TX2NX_ws/models:/work \
+  jazzy_minimal:arm64
 ```
 
 在容器内执行：
@@ -724,9 +669,8 @@ NX 磁盘配置
   -> NX Docker 与 runtime
   -> NX 数据目录迁移
   -> NX 网络代理
-  -> PC Docker 与代理
-  -> PC 跨架构构建
-  -> 测试一（Jazzy 通信）
+  -> PC 直连链路与 rsync 同步
+  -> 测试一（Jazzy 通信，NX 原生构建）
   -> 测试二（CUDA 直通）
   -> 测试三（TensorRT 与 YOLO）
 ```
@@ -773,18 +717,11 @@ NX 磁盘配置
 
 - NX 推理引擎锁定 TensorRT 8.2 / CUDA 10.2，不可升级。
 - 容器方案为单容器：Jazzy 加宿主挂载的 CUDA 与 TensorRT，推理层用 C++。
-- 镜像传输使用 `docker save` / `docker load`，不使用 registry。
-- NX 不安装 Clash Verge，复用 PC 的 Allow LAN 代理。
+- 编码在 PC，编译在 NX，镜像在 NX 原生构建。不使用 QEMU 交叉构建，不使用镜像仓库。
+- 源码与模型经 `rsync` over SSH 同步，走点对点千兆网线。不使用 `nc`。
+- PC 不安装 Docker。NX 不安装 Clash Verge，复用 PC 的 Allow LAN 代理。
 
-### 5.2 待确认事项
-
-事项 1：工作区根命名。本文档统一使用当前仓库 `~/Documents/TurtleBot3_TX2NX_ws/`，需确认是否与实际使用路径一致。
-
-事项 2：SSD 当前是否已物理安装且被系统识别。执行 2.1 前用 `lsblk` 确认 `nvme0n1` 存在且无有用数据。
-
-事项 3：NGC 镜像标签 `nvcr.io/nvidia/l4t-base:r32.7.1` 的可拉取性。执行 4.2 前用 `docker manifest inspect` 核实。
-
-### 5.3 已知风险
+### 5.2 已知风险
 
 风险 1：容器内 TensorRT 头文件与工具链的可用性，由测试三验证。
 
