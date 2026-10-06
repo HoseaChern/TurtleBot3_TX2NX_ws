@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: ../../build/minimal_test
+  Add:
+    - -Wall
+    - -Wextra
+  Compiler: gcc
