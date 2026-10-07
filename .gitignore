@@ -3,6 +3,9 @@ build/
 install/
 log/
 
+# 模型产物
+models/
+
 # Swap 与打包文件
 *.swap
 *.tar.gz
