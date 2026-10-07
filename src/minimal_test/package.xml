@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>Minimal ROS 2 publisher/subscriber pair for environment validation.</description>
   <maintainer email="chx_050913@163.com">changli</maintainer>
-  <license>MIT</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
