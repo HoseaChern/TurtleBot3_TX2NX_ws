@@ -1,5 +1,7 @@
 # TurtleBot3 TX2 NX Development Environment
 
+[中文](README.md)
+
 This repository sets up the ROS 2 development environment for TurtleBot3 on a Jetson TX2 NX. The PC handles coding and training; the NX handles native compilation and inference. Full deployment details are in `docs/Env_Plan.md`.
 
 ## Environment

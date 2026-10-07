@@ -1,5 +1,7 @@
 # TurtleBot3 TX2 NX 开发环境
 
+[English](README_EN.md)
+
 本仓库部署 TurtleBot3 在 Jetson TX2 NX 上的 ROS 2 开发环境。PC 负责编码与训练，NX 负责原生编译与推理。全部部署细节见 `docs/Env_Plan.md`。
 
 ## 基本环境
